@@ -43,13 +43,13 @@ object LocalRunner extends App {
     //    analyzeDataset(google)  //a lot of not unique domains
     //    analyzeDataset(website) //all domains are unique
 
-    val domainWindow = Window.partitionBy("domain").orderBy("name")
+    val domainWindow = Window.partitionBy("domain")
 
     // For joining from Google we take only records with unique domain
     val googleUniqueDomain = google
-      .withColumn("domainCount", count("domain") over domainWindow)
-      .filter(col("domainCount") === 1)
-      .drop(col("domainCount"))
+      .withColumn("cnt", count("domain").over(domainWindow))
+      .where("cnt = 1")
+      .drop(col("cnt"))
       .as[Google]
 
     // Records with not unique domains will be later unionAll for joined data
@@ -57,9 +57,9 @@ object LocalRunner extends App {
     // from the others like common domain like facebook.com, but it could only help to improve accuracy for
     // categories (not for phones, country, region and probably name)
     val googleNotUniqueDomain = google
-      .withColumn("domainCount", count("domain") over domainWindow)
-      .filter(col("domainCount") > 1)
-      .drop(col("domainCount"))
+      .withColumn("cnt", count("domain").over(domainWindow))
+      .where("cnt > 1")
+      .drop(col("cnt"))
       .as[Google]
 
     // First join facebook (we have all unique domains) with only google unique domains

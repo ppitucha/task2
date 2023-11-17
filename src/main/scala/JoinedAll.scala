@@ -8,7 +8,7 @@ case class JoinedAll(domain: String, f: Option[Facebook], g: Option[Google], w: 
   // Create a final output data for current record
   def toFinalData: FinalData = {
 
-    //we get merged values as well the score for this value
+    //we get merged values and calculate the score as well
     val (name, nameScore) = mergeName(this)
     val (category, categoryScore) = mergeCategory(this)
     val (phone, phoneScore) = mergePhone(this)
@@ -80,6 +80,51 @@ object JoinedAll {
     JoinedAll(domain.get, f, g, w)
   }
 
+  /*
+    Generic method for merging values basing on Similarity score - logic described in method
+   */
+  private def mergeGeneric[A](record: JoinedAll, allValues: List[Option[A]], score: Similarity[A], empty: A,
+                              getArbitraryValue: JoinedAll => A, getValueFromSimilar: List[A] => A): A =
+    score match {
+      // we don't have similar values and only one defined source - we just take it as a result
+      case Similarity(defined, _, Nil) if defined == 1 => allValues.flatten.head
+
+      // we don't have similar values and at least two source defined - this is conflict -
+      // in that case we apply arbitrary mapping function for this record
+      // as alternative solution can be used splitting up this record
+      case Similarity(defined, _, Nil) if defined > 1 => getArbitraryValue(record)
+
+      // we don't have similar values and not defined values - this is trash data return empty value
+      case Similarity(defined, _, Nil) if defined == 0 => empty
+
+      // we hava at least two similar values - in that case we use function to get from similar list
+      // as alternative approach we can only use this case when defined == similar and split up record otherwise
+      case Similarity(_, _, similar: List[A]) => getValueFromSimilar(similar)
+    }
+
+  /*
+    Generic method for calculating score
+   */
+  private def scoreGeneric[A](values: List[Option[A]], nonEmpty: A => Boolean,
+                              getSimilar: List[Option[A]] => Option[List[A]]): Similarity[A] = {
+
+    // +1 for each non empty value
+    val defined = values.flatten.count(nonEmpty)
+
+    //get similar values, at leas 2 needed
+    val similar: List[A] = getSimilar(values)
+      .collect { case list if list.size > 1 => list }
+      .getOrElse(List[A]())
+
+    Similarity(defined, similar.size, similar)
+  }
+
+  //common method to set value for similar is this case the longest value is considered the best
+  private def getLongestFromSimilar(similar: List[String]): String = similar
+    .map(el => (el, el.length))
+    .maxByOption(_._2)
+    .map(_._1)
+    .getOrElse("")
 
   /*
     Company names merging logic described in method body
@@ -106,129 +151,59 @@ object JoinedAll {
         .toSet
     }
 
-    /*
-      Calculates as
-        * definedScore as + 1 for each non empty name
-        * similarityScore as +1 each the same names (at least two needed) - cleaned bag of work compared
-        * return List of names that are considered the same - using namesUnified function
-     */
-    def namesScore(names: List[Option[String]]): Similarity[String] = {
-
-      // +1 for each non empty names
-      val definedScore = names
-        .flatten
-        .count(_.nonEmpty)
-
-      // +1 for the same names, 2 or more are needed
-      // for names there is used nameUnifies - bag of words representation for names
-      val similarNames = names
-        .flatten
-        .map(el => nameUnified(el) -> el) //bag of words used to represent name
-        .filter(_._1.nonEmpty)
-        .groupMap(_._1)(_._2)
-        .iterator
-        .maxByOption(_._2.size)
-        .collect { case (_, list) if list.size > 1 => list }
-        .getOrElse(List())
-
-      Similarity(definedScore, similarNames.size, similarNames)
-    }
-
-    val namesAll = extractNames(input)
-    val score = namesScore(namesAll)
+    // to get similar company name we use sanitize function nameUnified and used result bag of words to compate
+    def getSimilarNames(names: List[Option[String]]): Option[List[String]] = names
+      .flatten
+      .map(el => nameUnified(el) -> el) //bag of words used to represent name
+      .filter(_._1.nonEmpty)
+      .groupMap(_._1)(_._2)
+      .iterator
+      .maxByOption(_._2.size)
+      .map(_._2)
 
     // decision what name should be taken as final one
-    val name = score match {
-      // we don't have similar values and only one defined source - we just take it as a result
-      case Similarity(defined, _, Nil) if defined == 1 =>
-        namesAll
-          .flatten
-          .head
-
-      // we don't have similar values and at least two source defined - this is conflict -
-      // in that case we get data in name in particular order Facebook, Google, Website
-      // as alternative solution can be used splitting up this record
-      case Similarity(defined, _, Nil) if defined > 1 =>
-        val fValue = input.f.flatMap(_.name)
-        val gValue = input.g.flatMap(_.name)
-        val wValue = input.w.flatMap(_.legal_name).orElse(input.w.flatMap(_.site_name))
-
-        fValue.orElse(gValue).orElse(wValue).getOrElse("")
-
-      // we don't have similar values and not defined values - this is trash data return empty string
-      case Similarity(defined, _, Nil) if defined == 0 => ""
-
-      // we hava at least two similar values - in that case we just pick the longest one fro the similar ones
-      // as alternative approach we can only use this case when defined == similar and split up record otherwise
-      case Similarity(_, _, similar: List[String]) =>
-        similar
-          .map(el => (el, el.length))
-          .maxByOption(_._2)
-          .map(_._1)
-          .getOrElse("")
+    // for company names we get data in particular order Facebook, Google, Website
+    def namesArbitraryMapping(input: JoinedAll): String = {
+      val (fValue, gValue, wValue) = extractNames(input)
+      fValue.orElse(gValue).orElse(wValue).getOrElse("")
     }
+
+    val (fValue, gValue, wValue) = extractNames(input)
+    val namesAll = List(fValue, gValue, wValue)
+    val score = scoreGeneric(namesAll, (el: String) => el.nonEmpty, getSimilarNames)
+    val name = mergeGeneric(input, namesAll, score, "", namesArbitraryMapping, getLongestFromSimilar)
 
     (name, score)
   }
 
+
   /*
-    Mering category logic described in method body
-  */
+      Mering category logic described in method body
+    */
   def mergeCategory(input: JoinedAll): (String, Similarity[String]) = {
-    /*
-      Calculates as
-        * definedScore as + 1 for each non empty category
-        * similarityScore as +1 each the same category (at least two needed) - cleaned values compared
-     */
-    def categoryScore(categories: List[String]): Similarity[String] = {
 
-      // +1 for each non empty category
-      val definedScore = categories
-        .count(_.nonEmpty)
-        .min(3) // restricting to 3 defined (to avoid impact of many categories for Facebook)
+    // to get similar categories we only sanitize using trim and tolowercase
+    def getSimilarCategories(categories: List[Option[String]]): Option[List[String]] = categories
+      .flatten
+      .flatMap(_.split("\\|").toSet.toList) // extracting facebook categories only unique values
+      .map(el => el.toLowerCase().trim -> el)
+      .filter(_._1.nonEmpty)
+      .groupMap(_._1)(_._2)
+      .iterator
+      .maxByOption(_._2.size)
+      .map(_._2)
 
-      // +1 for the same category names, 2 or more are needed
-      val similarCategories = categories
-        .map(el => el.toLowerCase().trim -> el)
-        .filter(_._1.nonEmpty)
-        .groupMap(_._1)(_._2)
-        .iterator
-        .maxByOption(_._2.size)
-        .collect { case (_, list) if list.size > 1 => list }
-        .getOrElse(List())
-
-      Similarity(definedScore, similarCategories.size, similarCategories)
+    // decision what category should be taken as final one
+    // for categories we get data in particular order Facebook, Google, Website
+    def categoryArbitraryMapping(input: JoinedAll): String = {
+      val (fValue, gValue, wValue) = extractCategories(input)
+      fValue.orElse(gValue).orElse(wValue).getOrElse("")
     }
 
-    val allCategories = extractCategories(input)
-    val score = categoryScore(allCategories)
-
-    val category = score match {
-      // we don't have similar values and only one defined source - we just take it as a result
-      case Similarity(defined, _, Nil) if defined == 1 => allCategories.head
-
-      // we don't have similar values and at least two source defined - this is conflict -
-      // in that case we get data in name in particular order Facebook, Google, Website
-      // as alternative solution can be used splitting up this record
-      case Similarity(defined, _, Nil) if defined > 1 =>
-        val fValue = input.f.flatMap(_.categories)
-        val gValue = input.g.flatMap(_.category)
-        val wValue = input.w.flatMap(_.s_category)
-
-        fValue.orElse(gValue).orElse(wValue).getOrElse("")
-
-      // we don't have similar values and not defined values - this is trash data return empty string
-      case Similarity(defined, _, Nil) if defined == 0 => ""
-
-      // we hava at least two similar values - in that case we just pick the longest one from the similar ones
-      // as alternative approach we can only use this case when defined == similar and split up record otherwise
-      case Similarity(_, _, similar: List[String]) =>
-        similar
-          .map(el => (el, el.length))
-          .maxByOption(_._2)
-          .map(_._1)
-          .getOrElse("")
-    }
+    val (fValue, gValue, wValue) = extractCategories(input)
+    val allCategories = List(fValue, gValue, wValue)
+    val score = scoreGeneric(allCategories, (el: String) => el.nonEmpty, getSimilarCategories)
+    val category = mergeGeneric(input, allCategories, score, "", categoryArbitraryMapping, getLongestFromSimilar)
 
     (category, score)
   }
@@ -238,150 +213,88 @@ object JoinedAll {
    */
   def mergePhone(input: JoinedAll): (String, Similarity[String]) = {
 
-    /*
-      Calculates as
-        * definedScore as + 1 for each non empty phone
-        * similarityScore as +1 each the same phone number (at least two needed) - cleaned values compared
-     */
-    def phoneScore(): Similarity[String] = {
-      val (gPhone, fPhone, wPhone) = extractPhones(input)
-      val phones = List(gPhone, fPhone, wPhone)
-
-      val definedScore = phones
-        .flatten
-        .count(_.nonEmpty)
-
-      // +1 for the same phone, 2 or more are needed
-      // all not digit chars removed from phone
-      val similarPhones = phones
+    // to get similar phones we sanitize removing all not number values
+    def getSimilarPhones(phones: List[Option[String]]): Option[List[String]] =
+      phones
         .flatten
         .map(el => el.replaceAll("\\D", "").trim -> el)
         .filter(_._1.nonEmpty)
         .groupMap(_._1)(_._2)
         .iterator
         .maxByOption(_._2.size)
-        .collect { case (_, list) if list.size > 1 => list }
-        .getOrElse(List())
+        .map(_._2)
 
-      Similarity(definedScore, similarPhones.size, similarPhones)
+    // decision what category should be taken as final one
+    // for categories we get data in particular order Facebook, Google, Website
+    def categoryArbitraryMapping(input: JoinedAll): String = {
+      val (gPhone, fPhone, wPhone) = extractPhones(input)
+      gPhone.orElse(fPhone).orElse(wPhone).getOrElse("")
     }
 
     val (gPhone, fPhone, wPhone) = extractPhones(input)
+    val score = scoreGeneric(List(gPhone, fPhone, wPhone), (el: String) => el.nonEmpty, getSimilarPhones)
+    val phone = mergeGeneric(input, List(gPhone, fPhone, wPhone), score, "", categoryArbitraryMapping, getLongestFromSimilar)
 
-    val score = phoneScore()
-
-    val phone = score match {
-      // we don't have similar values and only one defined source - we just take it as a result
-      case Similarity(defined, _, Nil) if defined == 1 => gPhone.orElse(fPhone).orElse(wPhone).getOrElse("") //only one is not empty
-
-      // we don't have similar values and at least two source defined - this is conflict -
-      // in that case we get data in name in particular order Facebook, Google, Website
-      // as alternative solution can be used splitting up this record
-      case Similarity(defined, _, Nil) if defined > 1 => gPhone.orElse(fPhone).orElse(wPhone).getOrElse("")
-
-      // we don't have similar values and not defined values - this is trash data return empty string
-      case Similarity(defined, _, Nil) if defined == 0 => ""
-
-      // we hava at least two similar values - in that case we just pick the longest one from the similar ones
-      // as alternative approach we can only use this case when defined == similar and split up record otherwise
-      case Similarity(_, _, similar: List[String]) =>
-        similar
-          .map(el => (el, el.length))
-          .maxByOption(_._2)
-          .map(_._1)
-          .getOrElse("")
-    }
     (phone, score)
   }
-
 
   /*
      For country and region we prefer Website next Google and as a last source Facebook
      They must be taken both from one source to be consistent
      */
   def mergeCountyAndRegion(input: JoinedAll): ((String, String), Similarity[(String, String)]) = {
-    /*
-      Calculates as
-        * definedScore as + 1 for each non empty pair for country and region
-        * similarityScore as +1 each the same pair (at least two needed)
-     */
-    def countryAdnRegionScore():Similarity[(String, String)] = {
-      val (wCountryRegion, gCountryRegion, fCountryRegion) = extractCountryRegion(input)
-      val countryRegions = List(wCountryRegion, gCountryRegion, fCountryRegion)
 
-      // +1 for each defined pair of country and region
-      val definedScore = countryRegions
+    // to get similar categories we only sanitize using tolowecase and trim
+    def getSimilarCountryRegion(countryRegions: List[Option[(String, String)]]): Option[List[(String, String)]] =
+      countryRegions
         .flatten
-        .count(x => x._1.nonEmpty && x._2.nonEmpty)
-
-      // +1 for the country and region, 2 or more are needed
-      val similarList = countryRegions
-        .flatten
-        .map(el => (el._1.toLowerCase().trim, el._1.toLowerCase().trim) -> (el._1, el._2)) // we can think about using bag of words also here
+        .map(el => (el._1.toLowerCase().trim, el._1.toLowerCase().trim) -> (el._1, el._2))
         .filter(el => el._1._1.nonEmpty && el._1._2.nonEmpty)
         .groupMap(_._1)(_._2)
         .iterator
         .maxByOption(_._2.size)
-        .collect { case (_, list) if list.size > 1 => list }
-        .getOrElse(List())
+        .map(_._2)
 
-
-      Similarity(definedScore, similarList.size, similarList)
+    // decision what country region should be taken as final one
+    // we get data in particular order Facebook, Google, Website
+    def countryRegionArbitraryMapping(input: JoinedAll): (String, String) = {
+      val (wCountryRegion, gCountryRegion, fCountryRegion) = extractCountryRegion(input)
+      fCountryRegion.orElse(gCountryRegion).orElse(wCountryRegion).getOrElse(("", ""))
     }
+
+    //from the similar we just take first
+    def getCountryRegionFromSimilar(similar: List[(String, String)]): (String, String) = similar.head
 
     val (wCountryRegion, gCountryRegion, fCountryRegion) = extractCountryRegion(input)
-    val score = countryAdnRegionScore()
-
-    val countryRegion = score match {
-      // we don't have similar values and only one defined source - we just take it as a result
-      case Similarity(defined, _, Nil) if defined == 1 =>
-        fCountryRegion.orElse(gCountryRegion).orElse(wCountryRegion).getOrElse(("", "")) //only one is not empty
-
-      // we don't have similar values and at least two source defined - this is conflict -
-      // in that case we get data in name in particular order Facebook, Google, Website
-      // as alternative solution can be used splitting up this record
-      case Similarity(defined, _, Nil) if defined > 1 =>
-
-        fCountryRegion.orElse(gCountryRegion).orElse(wCountryRegion).getOrElse(("", ""))
-
-      // we don't have similar values and not defined values - this is trash data return empty string
-      case Similarity(defined, _, Nil) if defined == 0 => ("", "")
-
-      // we hava at least two similar values - in that case we just pick the longest one from the similar ones
-      // as alternative approach we can only use this case when defined == similar and split up record otherwise
-      case Similarity(_, _, similar: List[(String, String)]) =>
-        similar.head
-    }
+    val countryRegions = List(wCountryRegion, gCountryRegion, fCountryRegion)
+    val score = scoreGeneric(countryRegions, (el: (String, String)) => el._1.nonEmpty && el._2.nonEmpty, getSimilarCountryRegion)
+    val countryRegion = mergeGeneric(input, countryRegions, score, ("", ""), countryRegionArbitraryMapping, getCountryRegionFromSimilar)
 
     (countryRegion, score)
   }
 
-  private def extractPhones(input: JoinedAll): (Option[String], Option[String], Option[String]) =
-    (input.g.flatMap(_.phone),
-      input.f.flatMap(_.phone),
-      input.w.flatMap(_.phone))
+  private def extractPhones(input: JoinedAll): (Option[String], Option[String], Option[String]) = (
+    input.g.flatMap(_.phone),
+    input.f.flatMap(_.phone),
+    input.w.flatMap(_.phone)
+  )
 
-  private def extractNames(input: JoinedAll): List[Option[String]] =
-    List(
-      input.f.flatMap(_.name),
-      input.g.flatMap(_.name),
-      //For website_dataset if legal_name is empty we take site_name
-      input.w.flatMap(w => if (w.legal_name.isDefined && w.legal_name.get.nonEmpty) Some(w.legal_name.get) else w.site_name)
-    )
+  private def extractNames(input: JoinedAll): (Option[String], Option[String], Option[String]) = (
+    input.f.flatMap(_.name),
+    input.g.flatMap(_.name),
+    //For website_dataset if legal_name is empty we take site_name
+    input.w.flatMap(w => if (w.legal_name.isDefined && w.legal_name.get.nonEmpty) Some(w.legal_name.get) else w.site_name)
+  )
 
-  private def extractCategories(input: JoinedAll): List[String] = {
-    //we need to drop not unique categories for facebook data
-    val fCat = input.f.flatMap(f => f.categories).getOrElse("").split("\\|").toSet.toList //only unique names are taken
-    val gCat = input.g.flatMap(g => g.category).getOrElse("")
-    val wCat = input.w.flatMap(w => w.s_category).getOrElse("")
+  private def extractCategories(input: JoinedAll): (Option[String], Option[String], Option[String]) = (
+    input.f.flatMap(f => f.categories),
+    input.g.flatMap(g => g.category),
+    input.w.flatMap(w => w.s_category)
+  )
 
-    (fCat ++ List(gCat) ++ List(wCat)).filter(_.nonEmpty)
-  }
-
-  private def extractCountryRegion(input: JoinedAll): (Option[(String, String)], Option[(String, String)], Option[(String, String)]) = {
-    val wCountryRegion = input.w.flatMap(w => w.main_country.flatMap(country => w.main_region.map(region => (country, region))))
-    val gCountryRegion = input.g.flatMap(g => g.country_name.flatMap(country => g.region_name.map(region => (country, region))))
-    val fCountryRegion = input.f.flatMap(f => f.country_name.flatMap(country => f.region_name.map(region => (country, region))))
-    (fCountryRegion, gCountryRegion, wCountryRegion)
-  }
+  private def extractCountryRegion(input: JoinedAll): (Option[(String, String)], Option[(String, String)], Option[(String, String)]) = (
+    input.w.flatMap(w => w.main_country.flatMap(country => w.main_region.map(region => (country, region)))),
+    input.g.flatMap(g => g.country_name.flatMap(country => g.region_name.map(region => (country, region)))),
+    input.f.flatMap(f => f.country_name.flatMap(country => f.region_name.map(region => (country, region))))
+  )
 }
